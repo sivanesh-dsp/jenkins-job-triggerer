@@ -1,0 +1,115 @@
+pipeline {
+    agent any
+    parameters {
+        string(name: 'INSTANCE_1_URL', defaultValue: 'https://demo-tokens-jenkins.azure.dsudevops.nestle.biz/', description: 'Jenkins Instance 1 URL')
+        string(name: 'INSTANCE_2_URL', defaultValue: 'https://mobile-apps-jenkins.azure.dsudevops.nestle.biz/', description: 'Jenkins Instance 2 URL')
+        string(name: 'INSTANCE_1_JOBS', defaultValue: 'task-seed-pipeline', description: 'Comma-separated job names for Instance 1')
+        string(name: 'INSTANCE_2_JOBS', defaultValue: 'task-seed-pipeline', description: 'Comma-separated job names for Instance 2')
+    }
+    stages {
+        stage('Trigger Jobs for Instance 1') {
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') { // to not to skip below stages when this fails
+                    script {
+                        withCredentials([usernamePassword(credentialsId: 'instance1-credentials', usernameVariable: 'USERNAME', passwordVariable: 'TOKEN')]) {
+                            isInstanceUp(params.INSTANCE_1_URL, env.USERNAME, env.TOKEN, env.INSTANCE_1_JOBS)
+                        }
+                    }
+                }
+            }
+        }
+        stage('Trigger Jobs for Instance 2') {
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    script {
+                        withCredentials([usernamePassword(credentialsId: 'instance2-credentials', usernameVariable: 'USERNAME', passwordVariable: 'TOKEN')]) {
+                            isInstanceUp(params.INSTANCE_2_URL, env.USERNAME, env.TOKEN, env.INSTANCE_2_JOBS)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+def isInstanceUp(instanceUrl, user, token, jobs) {
+    script{
+        def responseCode = sh(
+            script: """
+                curl -s --connect-timeout 10 -m 30 -o /dev/null -w "%{http_code}" -X POST "${instanceUrl}" \
+                --user ${user}:${token}
+            """,
+            returnStdout: true
+        ).trim()
+
+        if (responseCode != "200") {
+            error "Instance not up and running... ${responseCode}"
+        } else {
+            triggerAndMonitorJobs(instanceUrl, user, token, jobs)
+        }
+    }    
+}
+
+def triggerAndMonitorJobs(instanceUrl, user, token, jobs) {
+    def jobList = jobs.split(',')
+    
+    for (job in jobList) {
+        stage("Status of job: ${job}") { // Create a stage for each job
+            script {
+                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                    echo "Triggering job: ${job} on ${instanceUrl}"
+                    def triggerUrl = "${instanceUrl}/job/${job}/buildWithParameters?WithTests=false"
+                    def responseCode = sh(
+                        script: """
+                            curl -s -o /dev/null -w "%{http_code}" -X POST "${triggerUrl}" \
+                            --user ${user}:${token}
+                        """,
+                        returnStdout: true
+                    ).trim()
+                    
+                    if (responseCode != null) {
+                        echo "Successfully triggered job: ${job}"
+                        monitorJobStatus(instanceUrl, user, token, job)
+                    } else {
+                        echo "Failed to trigger job: ${job}. Response code: ${responseCode}"
+                        error "Job: ${job} could not be triggered." // Fail the stage if the job couldn't be triggered
+                    }
+                }
+                
+            }
+        }
+    }
+}
+
+
+def monitorJobStatus(instanceUrl, user, token, job) {
+    def jobInfoUrl = "${instanceUrl}/job/${job}/lastBuild/api/json"
+    def jobStatus = null
+    
+    while (true) {
+        sleep(time: 30, unit: 'SECONDS') // Wait before checking again
+        def jobResponse = sh(
+            script: """
+                curl -s --user ${user}:${token} "${jobInfoUrl}"
+            """,
+            returnStdout: true
+        ).trim()
+        
+        def json = readJSON(text: jobResponse)
+        jobStatus = json.result
+        
+        if (jobStatus != null) {
+            echo "Job: ${job} completed with status: ${jobStatus}"
+            break // Exit the loop when the job is completed
+        }
+        
+        echo "Job: ${job} is still running. Waiting for completion..."
+        sleep(time: 50, unit: 'SECONDS') // Wait before checking again
+    }
+    
+    if (jobStatus == 'SUCCESS') {
+        echo "Job: ${job} finished successfully."
+    } else {
+        error "Job: ${job} failed with status: ${jobStatus}" // Mark the stage as failed if the job failed
+    }
+}
